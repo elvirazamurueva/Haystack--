@@ -11,6 +11,15 @@
 - Поддерживает **дедупликацию** записей по порогу сходства.
 - Работает через **HTTP-прокси** для Telegram и Pinecone.
 
+В проекте две реализации:
+
+| Реализация | Точка входа | Описание |
+|------------|-------------|----------|
+| Классическая | `bot.py` | Прямые вызовы GenAPI + `PineconeManager`, память с эвристиками |
+| **Haystack-ассистент** | `hay/bot.py` | Агент на **Haystack Agent** с инструментами и косинусной памятью Pinecone |
+
+Дальше основной раздел описывает классическую реализацию, а затем — **Haystack-ассистента**.
+
 ## Архитектура
 
 ```
@@ -241,22 +250,33 @@ python check_telegram_proxy.py
 ## Структура проекта
 
 ```
-VPg05/
+VPg06/
 ├── .env.example
 ├── .gitignore
 ├── README.md
-├── bot.py
+├── bot.py                     # классический бот (PineconeManager)
 ├── check_telegram_proxy.py
 ├── config.py
 ├── pinecone_manager.py
 ├── pytest.ini
 ├── requirements.txt
 ├── test_pinecone_connection.py
+├── verify_dedup.py
+├── hay/                       # Haystack-ассистент
+│   ├── __init__.py
+│   ├── settings.py            # конфигурация из env, секреты не раскрываются
+│   ├── embeddings.py          # эмбеддер GenAPI (с повторами при сбоях)
+│   ├── memory.py              # PineconeDocumentStore + PineconeEmbeddingRetriever (cosine)
+│   ├── dog_tools.py           # инструменты: факт о собаках, фото + vision-описание породы
+│   ├── assistant.py           # Haystack Agent + краткосрочная история диалога
+│   ├── bot.py                 # Telegram-бот поверх ассистента
+│   └── check_setup.py         # диагностика окружения и сквозной проверки
 └── tests/
     ├── __init__.py
     ├── conftest.py
     ├── test_bot.py
     ├── test_config.py
+    ├── test_hay_agent.py      # тесты пакета hay
     ├── test_memory_scenarios.py
     └── test_pinecone_manager.py
 ```
@@ -264,8 +284,11 @@ VPg05/
 ## Тестирование
 
 ```bash
-# Все тесты (74 теста):
+# Все тесты:
 python -m pytest tests/ -v
+
+# Только тесты Haystack-ассистента:
+python -m pytest tests/test_hay_agent.py -v
 
 # Только сценарии памяти:
 python -m pytest tests/test_memory_scenarios.py -v
@@ -274,3 +297,151 @@ python -m pytest tests/test_memory_scenarios.py -v
 python test_pinecone_connection.py
 python check_telegram_proxy.py
 ```
+
+---
+
+# Haystack-ассистент (`hay/`)
+
+Умный персональный помощник в Telegram на **Haystack Agent**: ведёт непрерывный
+диалог, помнит пользователя в **Pinecone** (косинусное сходство) и умеет вызывать
+инструменты с внешними данными.
+
+## Как это работает
+
+```
+Telegram → hay/bot.py (async, asyncio.to_thread)
+             │
+             ├─► hay/assistant.py — PersonalAssistant
+             │     ├─ 1. recall: косинусный поиск контекста в Pinecone
+             │     ├─ 2. system prompt с блоками <предпочтения>/<контекст>/<воспоминания>
+             │     ├─ 3. Haystack Agent (OpenAIChatGenerator через GenAPI)
+             │     │       └─ инструменты: random_dog_fact, random_dog_photo
+             │     ├─ 4. remember: реплика пользователя + результат инструмента
+             │     └─ 5. обновление краткосрочной истории диалога
+             │
+             └─► hay/memory.py — PineconeDocumentStore (metric=cosine)
+                   + PineconeEmbeddingRetriever + GenAPIEmbedder
+```
+
+Ключевые решения:
+
+- **Память — прямая интеграция Pinecone**: `PineconeDocumentStore` с `metric="cosine"`
+  и `PineconeEmbeddingRetriever`. Поиск идёт по косинусному сходству, порог отсечения
+  задаётся `HAY_MIN_SCORE`.
+- **Изоляция пользователей**: один namespace (`HAY_PINECONE_NAMESPACE`) + фильтр
+  `user_id` в метаданных, поэтому память одного пользователя недоступна другому.
+- **Контекст в каждом ходе**: перед вызовом агента собирается актуальный системный
+  промпт с найденными воспоминаниями — ассистент продолжает диалог, а не начинает заново.
+- **Краткосрочная память**: история диалога хранится в процессе (последние
+  `HAY_HISTORY_LIMIT` сообщений) и передаётся в `Agent.run` как `messages`.
+- **Идемпотентная запись**: id документа детерминирован (uuid5 от пользователя,
+  типа и текста), запись идёт с `DuplicatePolicy.OVERWRITE` — дублей не появляется.
+
+## Инструменты агента
+
+| Инструмент | API | Что делает |
+|------------|-----|------------|
+| `random_dog_fact` | `https://dogapi.dog/api/v2/facts` | Возвращает случайный факт о собаках |
+| `random_dog_photo` | `https://dog.ceo/api/breeds/image/random` | Берёт случайное фото, передаёт его в vision-модель и возвращает описание породы, внешних признаков и краткой предыстории происхождения породы |
+
+Оба API бесплатны и не требуют ключей. Результат `random_dog_photo` кладётся в
+состояние агента (`dog_photo_url`), и бот отправляет картинку отдельным сообщением.
+Если vision-модель недоступна, инструмент возвращает упрощённое описание по
+подсказке породы из URL — диалог не ломается.
+
+## Команды бота
+
+| Команда | Описание |
+|---------|----------|
+| `/start` | Приветствие и список возможностей |
+| `/help` | Как общаться с ассистентом |
+| `/memory` | Показать, что ассистент помнит (последние 15 записей) |
+| `/reset` | Забыть историю текущего диалога (долговременная память остаётся) |
+| `/forget` | Полностью стереть память пользователя из Pinecone |
+
+## Запуск
+
+```bash
+# PowerShell: активируйте окружение
+.venv\Scripts\Activate.ps1
+
+# Установка зависимостей (haystack-ai, pinecone-haystack и остальное)
+pip install -r requirements.txt
+
+# Запуск ассистента (любой из вариантов)
+python -m hay.bot
+python hay/bot.py
+```
+
+Классический бот (`python bot.py`) продолжает работать независимо.
+
+## Диагностика
+
+```bash
+# Офлайн: конфигурация + сборка агента (без сети и без ключей)
+python -m hay.check_setup --offline
+
+# Только бесплатные внешние API (факт о собаках, фото + vision)
+python -m hay.check_setup --tools
+
+# Всё: эмбеддинги, Pinecone, инструменты
+python -m hay.check_setup
+
+# Плюс сквозной круг «память + агент + инструмент» (тестовые записи удаляются)
+python -m hay.check_setup --full
+```
+
+Секреты в выводе не раскрываются: показывается только признак «задан» и длина.
+
+## Переменные окружения для ассистента
+
+Обязательные — те же, что и для классического бота (`GENAPI_API_KEY`,
+`PINECONE_API_KEY`, `PINECONE_INDEX_NAME`, `TELEGRAM_BOT_TOKEN`).
+
+Дополнительные (все необязательные):
+
+| Переменная | По умолчанию | Назначение |
+|------------|--------------|------------|
+| `EMBEDDING_DIM` | `1536` | Размерность эмбеддингов и индекса Pinecone |
+| `HAY_CHAT_MODEL` | `gpt-4o-mini` | Модель для ответов |
+| `HAY_VISION_MODEL` | `gpt-4o-mini` | Модель для описания фото собаки |
+| `HAY_GENAPI_BASE_URL` | из `GENAPI_URL` | Base URL OpenAI-совместимого API |
+| `HAY_PINECONE_NAMESPACE` | `hay-assistant` | Namespace памяти ассистента |
+| `HAY_PINECONE_METRIC` | `cosine` | Метрика сходства (менять не нужно) |
+| `HAY_PINECONE_CLOUD` / `HAY_PINECONE_REGION` | `aws` / `us-east-1` | Параметры создания индекса |
+| `HAY_TOP_K` | `5` | Сколько воспоминаний поднимать на запрос |
+| `HAY_MIN_SCORE` | `0.2` | Минимальное косинусное сходство |
+| `HAY_MAX_AGENT_STEPS` | `6` | Лимит шагов агента (tool-calling loop) |
+| `HAY_HISTORY_LIMIT` | `12` | Размер краткосрочной истории диалога |
+| `HAY_TIMEOUT` | `30` | Таймаут запросов, секунд |
+
+## Особенности реализации Haystack-ассистента
+
+1. **Прокси для Pinecone.** `PineconeDocumentStore` не принимает `proxy_url`, а SDK
+   Pinecone игнорирует `HTTPS_PROXY`. Поэтому индекс подключается явно через
+   `Pinecone(api_key=..., proxy_url=...)` в `hay/memory.py`. Без этого в сетях без
+   прямого доступа к Pinecone запросы падают с `WinError 10054`.
+2. **Синтаксис фильтров.** `pinecone-haystack` требует формат
+   `{"field": ..., "operator": "==", "value": ...}`; сокращённый синтаксис ядра
+   Haystack вызывает `Invalid filter syntax`.
+3. **Ленивое подключение.** Клиент Pinecone создаётся при первом обращении к памяти,
+   поэтому `--offline` диагностика и тесты работают без сети.
+4. **Повторы эмбеддингов.** `hay/embeddings.py` повторяет запрос при 429/5xx и
+   таймаутах (4 попытки с экспоненциальной паузой); ошибки 4xx не повторяются.
+5. **Защита от prompt injection.** Пользовательский текст и сохранённые воспоминания
+   экранируются (`{` → `(`, `}` → `)`) и передаются в системном промпте как
+   справочные блоки с явным указанием не выполнять инструкции из них.
+6. **Секреты.** Ключи читаются только из окружения и передаются как
+   `haystack.utils.Secret`; в `repr` настроек и в логах их нет.
+
+## Известные ограничения Haystack-ассистента
+
+1. Краткосрочная история живёт в памяти процесса — после перезапуска диалог
+   начинается заново (долговременная память в Pinecone сохраняется).
+2. Память пишется по факту реплики пользователя и результата инструмента;
+   ответы ассистента в Pinecone не дублируются.
+3. Vision-описание породы — вероятностное: модель может ошибиться в породе,
+   особенно на помесях.
+4. `filter_documents` в Pinecone ограничен `top_k` (10 000), поэтому `/memory`
+   показывает только последние записи, а не всю историю целиком.
+

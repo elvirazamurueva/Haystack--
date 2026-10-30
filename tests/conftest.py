@@ -25,8 +25,50 @@ def _clear_env():
         "PROXY_URL",
         "TIMEOUT_GENAPI",
         "TIMEOUT_PINECONE",
+        "EMBEDDING_DIM",
     ]:
         os.environ.pop(key, None)
+    # Переменные пакета hay
+    for key in list(os.environ):
+        if key.startswith("HAY_"):
+            os.environ.pop(key, None)
+
+
+@pytest.fixture
+def hay_env(monkeypatch):
+    """
+    Тестовое окружение для пакета hay.
+
+    Реальный .env не читается (load_dotenv заглушается), чтобы в тесты
+    не попадали настоящие ключи. Используются только фейковые значения.
+    """
+    monkeypatch.setattr("hay.settings.load_dotenv", lambda *args, **kwargs: None)
+
+    values = {
+        "GENAPI_API_KEY": "test-genapi-key",
+        "PINECONE_API_KEY": "test-pinecone-key",
+        "PINECONE_INDEX_NAME": "test-index",
+        "TELEGRAM_BOT_TOKEN": "test-bot-token",
+        "GENAPI_URL": "https://proxy.gen-api.ru/v1/chat/completions",
+        "MODEL_ID": "gpt-4o-mini",
+        "GENAPI_EMBEDDINGS_URL": "https://api.gen-api.ru/api/v1/networks/embeddings",
+        "EMBEDDING_MODEL": "text-embedding-3-small",
+        "EMBEDDING_DIM": "1536",
+        "HAY_PINECONE_NAMESPACE": "hay-test",
+        "HAY_MIN_SCORE": "0.2",
+        "HAY_TOP_K": "5",
+    }
+    for key, value in values.items():
+        monkeypatch.setenv(key, value)
+    return values
+
+
+@pytest.fixture
+def hay_settings(hay_env):
+    """Конфигурация ассистента, собранная из фейчных переменных окружения."""
+    from hay.settings import load_hay_settings
+
+    return load_hay_settings()
 
 
 @pytest.fixture
